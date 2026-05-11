@@ -1,0 +1,287 @@
+esphome:
+  name: stitch-indoor
+  friendly_name: Stitch Indoor
+  on_boot:
+    priority: -100
+    then:
+      - lambda: 'id(stitch_display).set_contrast(0.0);'
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: arduino
+
+api:
+  encryption:
+    key: "R4pFBpZ/aK4btNTbh/bTCXrLC0q4efkjzufsJccQtbU="
+
+ota:
+  - platform: esphome
+
+logger:
+
+wifi:
+  ssid: "StitchNet"
+  password: "Nallenkoski65"
+  output_power: 8.5dB
+  fast_connect: true
+  power_save_mode: NONE
+
+# --- MQTT CONFIGURATION (ADDED) ---
+mqtt:
+  broker: 192.168.68.204
+  username: "birdnet"
+  password: "1234"
+
+  on_message:
+    - topic: scout/weather
+      then:
+        - lambda: |-
+            json::parse_json(x, [](JsonObject root) -> bool {
+              // Update Outdoor Temperature
+              if (root["temp"].is<float>()) {
+                id(outdoor_temp_val).publish_state(root["temp"]);
+              }
+              // Update Outdoor Humidity
+              if (root["hum"].is<float>()) {
+                id(out_hum_val).publish_state(root["hum"]);
+              }
+              // Update Outdoor Pressure
+              if (root["pres"].is<float>()) {
+                id(out_press).publish_state(root["pres"]);
+              }
+              return true;
+            });
+
+# --- TIME ---
+time:
+  - platform: homeassistant
+    id: s_time
+    on_time_sync:
+      then:
+        - lambda: |-
+            auto time = id(s_time).now();
+            int mins = time.hour * 60 + time.minute;
+            // 1350 is 22:30, 410 is 06:50. Handles state correctness if the device reboots during the night.
+            if (mins >= 1350 || mins < 410) {
+              id(stitch_display).turn_off();
+            } else {
+              id(stitch_display).turn_on();
+            }
+    on_time:
+      - seconds: 0
+        minutes: 30
+        hours: 22
+        then:
+          - lambda: 'id(stitch_display).turn_off();'
+      - seconds: 0
+        minutes: 50
+        hours: 6
+        then:
+          - lambda: 'id(stitch_display).turn_on();'
+          - number.set:
+              id: display_manual_contrast
+              value: 0
+
+# --- SENSORS ---
+sensor:
+  - platform: aht10
+    variant: AHT20
+    temperature:
+      name: "Stitch Indoor Temperature"
+      id: room_temp
+      device_class: temperature
+      state_class: measurement
+    humidity:
+      name: "Stitch Indoor Humidity"
+      id: room_hum
+      device_class: humidity
+      state_class: measurement
+
+  # --- UPDATED: NOW TEMPLATE SENSORS (Filled by MQTT) ---
+  - platform: template
+    name: "Stitch Outdoor Temp"
+    id: outdoor_temp_val
+    unit_of_measurement: "°C"
+
+  - platform: template
+    name: "Stitch Outdoor Pressure"
+    id: out_press
+    unit_of_measurement: "hPa"
+
+  - platform: template
+    name: "Stitch Outdoor Humidity"
+    id: out_hum_val
+    unit_of_measurement: "%"
+
+  # --- KEPT AS HA SENSOR (Scout doesn't send trend, matching your reference) ---
+  - platform: homeassistant
+    entity_id: sensor.outdoor_pressure_trend
+    id: baro_trend
+    internal: true
+
+# --- DISPLAY CONFIG ---
+font:
+  - file: "gfonts://Roboto"
+    id: font_time
+    size: 28
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 12
+
+i2c:
+  sda: 5
+  scl: 6
+  scan: false
+  frequency: 400kHz
+
+number:
+  - platform: template
+    name: "Stitch Display Contrast"
+    id: display_manual_contrast
+    optimistic: true
+    min_value: 0
+    max_value: 100
+    step: 1
+    initial_value: 0
+    set_action:
+      then:
+        - lambda: 'id(stitch_display).set_contrast(x / 100.0);'
+
+display:
+  - platform: ssd1306_i2c
+    model: "SH1106 128x64"
+    id: stitch_display
+    address: 0x3C
+    rotation: 180°
+    offset_x: 2
+    update_interval: 100ms
+
+    lambda: |-
+      // --- PRIORITY 1: ALARM MODE ---
+      if (id(alarm_active_mode).state && id(stitch_lamp).remote_values.is_on()) {
+        id(anim_sunrise).next_frame();
+        it.image(0, 0, id(anim_sunrise), COLOR_ON, COLOR_OFF);
+        return;
+      }
+
+      // --- PRIORITY 2: STANDARD CLOCK ---
+      it.strftime(0, -4, id(font_time), TextAlign::TOP_LEFT, "%H", id(s_time).now());
+      it.strftime(15, 22, id(font_time), TextAlign::TOP_LEFT, "%M", id(s_time).now());
+      it.printf(0, 52, id(font_small), TextAlign::TOP_LEFT, "In:%.1f", id(room_temp).state);
+
+      if (id(outdoor_temp_val).has_state()) {
+        it.printf(128, 52, id(font_small), TextAlign::TOP_RIGHT, "Out:%.1f", id(outdoor_temp_val).state);
+      } else {
+        it.print(128, 52, id(font_small), TextAlign::TOP_RIGHT, "Sync..");
+      }
+
+      // --- 3. WEATHER ANIMATION ---
+      if (id(baro_trend).has_state()) {
+        if (id(baro_trend).state < -0.1) {
+          id(anim_bad_weather).next_frame();
+          it.image(60, 0, id(anim_bad_weather), COLOR_OFF, COLOR_ON);
+        }
+        else if (id(baro_trend).state > 0.1) {
+          id(anim_good_weather).next_frame();
+          it.image(60, 0, id(anim_good_weather), COLOR_ON, COLOR_OFF);
+        }
+        else {
+          id(anim_stable_weather).next_frame();
+          it.image(60, 0, id(anim_stable_weather), COLOR_OFF, COLOR_ON);
+        }
+      } else {
+        id(anim_stable_weather).next_frame();
+        it.image(60, 0, id(anim_stable_weather), COLOR_OFF, COLOR_ON);
+      }
+
+# --- LIGHTS & OUTPUTS ---
+output:
+  - platform: ledc
+    pin: 3
+    id: lamp_pwm
+
+  - platform: ledc
+    pin: 10
+    id: bulb_pwm
+
+light:
+  - platform: monochromatic
+    output: lamp_pwm
+    name: "Stitch Sunrise Lamp"
+    id: stitch_lamp
+    default_transition_length: 2s
+
+  - platform: monochromatic
+    output: bulb_pwm
+    name: "Stitch Alarm Bulb"
+    id: alarm_bulb
+    default_transition_length: 0.5s
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: 4
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "Stitch Button"
+    on_multi_click:
+      # --- DOUBLE CLICK: Night Light Mode (Steady) ---
+      - timing:
+          - ON for at most 1s
+          - OFF for at most 0.4s
+          - ON for at most 1s
+          - OFF for at least 0.2s
+        then:
+          - light.turn_on:
+              id: alarm_bulb
+              brightness: 100%
+
+      # --- SINGLE CLICK: Priority Logic ---
+      - timing:
+          - ON for at most 1s
+          - OFF for at least 0.4s
+        then:
+          - if:
+              condition:
+                lambda: 'return id(alarm_active_mode).state;'
+              then:
+                # 1. Stop active sunrise alarm
+                - switch.turn_off: alarm_active_mode
+                - light.turn_off: stitch_lamp
+              else:
+                - if:
+                    condition:
+                      light.is_on: alarm_bulb
+                    then:
+                      # 2. If Night Light is on, turn it off
+                      - light.turn_off: alarm_bulb
+                    else:
+                      # 3. Otherwise, toggle the main lamp
+                      - light.toggle: stitch_lamp
+
+animation:
+  - file: "sad.gif"
+    id: anim_bad_weather
+    type: BINARY
+  - file: "nominal.gif"
+    id: anim_good_weather
+    type: BINARY
+  - file: "hug.gif"
+    id: anim_stable_weather
+    type: BINARY
+  - file: "good.gif"
+    id: anim_sunrise
+    type: BINARY
+
+switch:
+  - platform: template
+    name: "Stitch Alarm Active"
+    id: alarm_active_mode
+    optimistic: true
+
+  - platform: template
+    name: "Alarm Master Enable"
+    id: alarm_master_enable
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
