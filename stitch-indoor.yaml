@@ -1,6 +1,11 @@
 esphome:
   name: stitch-indoor
   friendly_name: Stitch Indoor
+  on_boot:
+    priority: -100
+    then:
+      - lambda: 'id(stitch_display).set_contrast(0.0);'
+      - switch.turn_on: display_power
 
 esp32:
   board: esp32-c3-devkitm-1
@@ -23,36 +28,176 @@ wifi:
   fast_connect: true
   power_save_mode: NONE
 
-# --- MQTT CONFIGURATION (ADDED) ---
+# --- GLOBALS ---
+globals:
+  - id: is_sleep_window_active
+    type: bool
+    initial_value: 'false'
+
+# --- MQTT CONFIGURATION ---
 mqtt:
   broker: 192.168.68.204
   username: "birdnet"
   password: "1234"
+  discovery: false
 
   on_message:
     - topic: scout/weather
       then:
         - lambda: |-
             json::parse_json(x, [](JsonObject root) -> bool {
-              // Update Outdoor Temperature
-              if (root["temp"].is<float>()) {
-                id(outdoor_temp_val).publish_state(root["temp"]);
-              }
-              // Update Outdoor Humidity
-              if (root["hum"].is<float>()) {
-                id(out_hum_val).publish_state(root["hum"]);
-              }
-              // Update Outdoor Pressure
-              if (root["pres"].is<float>()) {
-                id(out_press).publish_state(root["pres"]);
-              }
+              if (root["temp"].is<float>()) id(outdoor_temp_val).publish_state(root["temp"]);
+              if (root["hum"].is<float>()) id(out_hum_val).publish_state(root["hum"]);
+              if (root["pres"].is<float>()) id(out_press).publish_state(root["pres"]);
               return true;
             });
 
-# --- TIME ---
+# --- READ TIME FROM HOME ASSISTANT ---
+text_sensor:
+  - platform: homeassistant
+    id: ha_wake_up_time
+    entity_id: input_datetime.stitch_wake_up_time
+    internal: true
+  - platform: homeassistant
+    id: ha_display_on_time
+    entity_id: input_datetime.display_on_time
+    internal: true
+  - platform: homeassistant
+    id: ha_display_off_time
+    entity_id: input_datetime.display_off_time
+    internal: true
+
+# --- TIME & SCHEDULE LOGIC ---
 time:
   - platform: homeassistant
     id: s_time
+    on_time:
+      - seconds: 0
+        then:
+          # 1. Sunrise Alarm Check
+          - lambda: |-
+              if (!id(alarm_master_enable).state) return;
+
+              std::string time_str = id(ha_wake_up_time).state;
+              if (time_str.length() < 5) return;
+
+              int wake_h = atoi(time_str.substr(0, 2).c_str());
+              int wake_m = atoi(time_str.substr(3, 2).c_str());
+              int wake_total = wake_h * 60 + wake_m;
+
+              auto time = id(s_time).now();
+              if (!time.is_valid()) return;
+              int curr_total = time.hour * 60 + time.minute;
+
+              int dur = id(sunrise_duration).state;
+              int start_total = wake_total - dur;
+              if (start_total < 0) start_total += 1440;
+
+              if (curr_total == start_total) {
+                id(sunrise_script).execute();
+              }
+
+          # 2. Display Auto-Sleep Logic
+          - lambda: |-
+              if (id(display_auto_sleep).state) {
+                std::string off_str = id(ha_display_off_time).state;
+                std::string on_str = id(ha_display_on_time).state;
+
+                if (off_str.length() >= 5 && on_str.length() >= 5) {
+                  int off_t = atoi(off_str.substr(0, 2).c_str()) * 60 + atoi(off_str.substr(3, 2).c_str());
+                  int on_t = atoi(on_str.substr(0, 2).c_str()) * 60 + atoi(on_str.substr(3, 2).c_str());
+
+                  auto time = id(s_time).now();
+                  if (time.is_valid()) {
+                    int curr = time.hour * 60 + time.minute;
+                    bool sleeping = false;
+                    if (off_t < on_t) {
+                      sleeping = (curr >= off_t && curr < on_t);
+                    } else {
+                      sleeping = (curr >= off_t || curr < on_t);
+                    }
+                    id(is_sleep_window_active) = sleeping;
+                  }
+                }
+
+                // Enforce schedule, but respect active overrides (button press or active alarm)
+                if (id(is_sleep_window_active)) {
+                  if (!id(temp_display_script).is_running() && !id(sunrise_script).is_running() && id(display_power).state) {
+                    id(display_power).turn_off();
+                  }
+                } else {
+                  if (!id(display_power).state) {
+                    id(display_power).turn_on();
+                  }
+                }
+              } else {
+                id(is_sleep_window_active) = false;
+              }
+
+# --- SCRIPTS ---
+script:
+  # Temporary 5-Minute Wake Script
+  - id: temp_display_script
+    mode: restart
+    then:
+      - switch.turn_on: display_power
+      - delay: 5min
+      - light.turn_off: stitch_lamp
+      - light.turn_off: alarm_bulb
+      - switch.turn_off: alarm_active_mode
+      - lambda: |-
+          if (id(display_auto_sleep).state && id(is_sleep_window_active)) {
+            id(display_power).turn_off();
+          }
+
+  # Sunrise Automation Script
+  - id: sunrise_script
+    mode: restart
+    then:
+      - switch.turn_on: alarm_active_mode
+      - switch.turn_on: display_power
+
+      # Force a cache reset on the light state
+      - light.turn_off:
+          id: stitch_lamp
+          transition_length: 0s
+      - delay: 200ms
+
+      # Phase 1: Initialize at dim deep red/orange
+      - light.turn_on:
+          id: stitch_lamp
+          red: 1.0
+          green: 0.05
+          blue: 0.0
+          brightness: 0.01
+          transition_length: 0s
+
+      - delay: 1s
+
+      # Phase 2: Transition to pure white over 80% of the duration
+      - light.turn_on:
+          id: stitch_lamp
+          red: 1.0
+          green: 1.0
+          blue: 1.0
+          brightness: 1.0
+          transition_length: !lambda "return (uint32_t)(id(sunrise_duration).state * 60.0 * 0.8 * 1000.0);"
+
+      - delay: !lambda "return (uint32_t)(id(sunrise_duration).state * 60.0 * 0.8 * 1000.0);"
+
+      # Phase 3: Hold pure white for the last 20% of the duration
+      - delay: !lambda "return (uint32_t)(id(sunrise_duration).state * 60.0 * 0.2 * 1000.0);"
+
+      # Phase 4: Alarm triggers!
+      - light.turn_on:
+          id: alarm_bulb
+          brightness: 100%
+
+      # Phase 5: Auto-Shutoff
+      - delay: 5min
+      - switch.turn_off: alarm_active_mode
+      - light.turn_off: stitch_lamp
+      - light.turn_off: alarm_bulb
 
 # --- SENSORS ---
 sensor:
@@ -69,7 +214,6 @@ sensor:
       device_class: humidity
       state_class: measurement
 
-  # --- UPDATED: NOW TEMPLATE SENSORS (Filled by MQTT) ---
   - platform: template
     name: "Stitch Outdoor Temp"
     id: outdoor_temp_val
@@ -85,7 +229,6 @@ sensor:
     id: out_hum_val
     unit_of_measurement: "%"
 
-  # --- KEPT AS HA SENSOR (Scout doesn't send trend, matching your reference) ---
   - platform: homeassistant
     entity_id: sensor.outdoor_pressure_trend
     id: baro_trend
@@ -101,8 +244,8 @@ font:
     size: 12
 
 i2c:
-  sda: 5
-  scl: 6
+  sda: 8
+  scl: 9
   scan: false
   frequency: 400kHz
 
@@ -114,10 +257,21 @@ number:
     min_value: 0
     max_value: 100
     step: 1
-    initial_value: 80
+    initial_value: 0
     set_action:
       then:
         - lambda: 'id(stitch_display).set_contrast(x / 100.0);'
+
+  - platform: template
+    name: "Stitch Sunrise Duration"
+    id: sunrise_duration
+    min_value: 1
+    max_value: 60
+    step: 1
+    initial_value: 15
+    optimistic: true
+    unit_of_measurement: "min"
+    icon: mdi:weather-sunset-up
 
 display:
   - platform: ssd1306_i2c
@@ -129,14 +283,12 @@ display:
     update_interval: 100ms
 
     lambda: |-
-      // --- PRIORITY 1: ALARM MODE ---
       if (id(alarm_active_mode).state && id(stitch_lamp).remote_values.is_on()) {
         id(anim_sunrise).next_frame();
         it.image(0, 0, id(anim_sunrise), COLOR_ON, COLOR_OFF);
         return;
       }
 
-      // --- PRIORITY 2: STANDARD CLOCK ---
       it.strftime(0, -4, id(font_time), TextAlign::TOP_LEFT, "%H", id(s_time).now());
       it.strftime(15, 22, id(font_time), TextAlign::TOP_LEFT, "%M", id(s_time).now());
       it.printf(0, 52, id(font_small), TextAlign::TOP_LEFT, "In:%.1f", id(room_temp).state);
@@ -147,17 +299,14 @@ display:
         it.print(128, 52, id(font_small), TextAlign::TOP_RIGHT, "Sync..");
       }
 
-      // --- 3. WEATHER ANIMATION ---
       if (id(baro_trend).has_state()) {
         if (id(baro_trend).state < -0.1) {
           id(anim_bad_weather).next_frame();
           it.image(60, 0, id(anim_bad_weather), COLOR_OFF, COLOR_ON);
-        }
-        else if (id(baro_trend).state > 0.1) {
+        } else if (id(baro_trend).state > 0.1) {
           id(anim_good_weather).next_frame();
           it.image(60, 0, id(anim_good_weather), COLOR_ON, COLOR_OFF);
-        }
-        else {
+        } else {
           id(anim_stable_weather).next_frame();
           it.image(60, 0, id(anim_stable_weather), COLOR_OFF, COLOR_ON);
         }
@@ -169,25 +318,36 @@ display:
 # --- LIGHTS & OUTPUTS ---
 output:
   - platform: ledc
+    pin: 2
+    id: red_pwm
+  - platform: ledc
     pin: 3
-    id: lamp_pwm
+    id: green_pwm
+  - platform: ledc
+    pin: 1
+    id: blue_pwm
 
   - platform: ledc
     pin: 10
     id: bulb_pwm
 
 light:
-  - platform: monochromatic
-    output: lamp_pwm
+  - platform: rgb
     name: "Stitch Sunrise Lamp"
     id: stitch_lamp
+    red: red_pwm
+    green: green_pwm
+    blue: blue_pwm
     default_transition_length: 2s
+    gamma_correct: 2.8
+    restore_mode: RESTORE_DEFAULT_OFF
 
   - platform: monochromatic
     output: bulb_pwm
     name: "Stitch Alarm Bulb"
     id: alarm_bulb
     default_transition_length: 0.5s
+    restore_mode: RESTORE_DEFAULT_OFF
 
 binary_sensor:
   - platform: gpio
@@ -197,39 +357,69 @@ binary_sensor:
       inverted: true
     name: "Stitch Button"
     on_multi_click:
-      # --- DOUBLE CLICK: Night Light Mode (Steady) ---
+      # --- DOUBLE CLICK ---
       - timing:
           - ON for at most 1s
           - OFF for at most 0.4s
           - ON for at most 1s
           - OFF for at least 0.2s
         then:
-          - light.turn_on:
-              id: alarm_bulb
-              brightness: 100%
+          - if:
+              condition:
+                lambda: 'return !id(display_power).state;'
+              then:
+                # Screen is OFF: Wakes screen, starts 5-min timer. Stops here.
+                - switch.turn_on: display_power
+                - script.execute: temp_display_script
+              else:
+                # Screen is ON: Toggle light logic
+                - if:
+                    condition:
+                      lambda: 'return id(display_auto_sleep).state && id(is_sleep_window_active);'
+                    then:
+                      # If it is sleeping hours, interacting restarts the 5-min timer
+                      - script.execute: temp_display_script
+                - light.turn_on:
+                    id: alarm_bulb
+                    brightness: 100%
 
-      # --- SINGLE CLICK: Priority Logic ---
+      # --- SINGLE CLICK ---
       - timing:
           - ON for at most 1s
           - OFF for at least 0.4s
         then:
           - if:
               condition:
-                lambda: 'return id(alarm_active_mode).state;'
+                lambda: 'return !id(display_power).state;'
               then:
-                # 1. Stop active sunrise alarm
-                - switch.turn_off: alarm_active_mode
-                - light.turn_off: stitch_lamp
+                # Screen is OFF: Wakes screen, starts 5-min timer. Stops here.
+                - switch.turn_on: display_power
+                - script.execute: temp_display_script
               else:
+                # Screen is ON: Toggle light logic
                 - if:
                     condition:
-                      light.is_on: alarm_bulb
+                      lambda: 'return id(display_auto_sleep).state && id(is_sleep_window_active);'
                     then:
-                      # 2. If Night Light is on, turn it off
+                      - script.execute: temp_display_script
+
+                # Check priority logic for lights
+                - if:
+                    condition:
+                      lambda: 'return id(alarm_active_mode).state;'
+                    then:
+                      - script.stop: sunrise_script
+                      - switch.turn_off: alarm_active_mode
+                      - light.turn_off: stitch_lamp
                       - light.turn_off: alarm_bulb
                     else:
-                      # 3. Otherwise, toggle the main lamp
-                      - light.toggle: stitch_lamp
+                      - if:
+                          condition:
+                            light.is_on: alarm_bulb
+                          then:
+                            - light.turn_off: alarm_bulb
+                          else:
+                            - light.toggle: stitch_lamp
 
 animation:
   - file: "sad.gif"
@@ -256,3 +446,21 @@ switch:
     id: alarm_master_enable
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
+
+  - platform: template
+    name: "Display Auto Sleep"
+    id: display_auto_sleep
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    icon: mdi:sleep
+
+  - platform: template
+    name: "Display Power"
+    id: display_power
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    icon: mdi:monitor
+    turn_on_action:
+      - lambda: 'id(stitch_display).turn_on();'
+    turn_off_action:
+      - lambda: 'id(stitch_display).turn_off();'
